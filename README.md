@@ -64,7 +64,7 @@ scatter-gather: off
 rx-gro-hw: off
 rx-udp-gro-forwarding: off
 
-univ-offload@eth极.service: enabled
+univ-offload@eth.service: enabled
 univ-offload@eth0.service: active
 ```
 
