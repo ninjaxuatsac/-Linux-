@@ -73,7 +73,7 @@ univ-offload@eth0.service: active
 ## 🔁 自动修复缺失项
 
 ```bash
-bash -c "$(curl -fsSL https极raw.githubusercontent.com/buyi06/-Linux-/main/universal_optimize.sh)" repair
+bash -c "$(curl -fsSL httpsraw.githubusercontent.com/buyi06/-Linux-/main/universal_optimize.sh)" repair
 ```
 
 脚本会检测并修复：
