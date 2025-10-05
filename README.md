@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-Optimize-brightgreen?style=for-the-badge&logo=linux" />
+  <img src="https://img.shields.io/badge/Safe-Stable-blue?style=for-the-badge&logo=shield" />
+  <img src="https://img.shields.io/badge/Bash-Script-orange?style=for-the-badge&logo=gnubash" />
+  <br>
+  🔥 通用一键 Linux 优化脚本 · 安全、通用、持久
+</p>
 # 🧠 Universal Optimize - Linux 通用安全性能优化脚本
 
 适用于 **Debian / Ubuntu / CentOS / KVM / BareMetal / XanMod** 等环境的一键通用优化脚本。兼顾 **性能 / 稳定 / 安全**，让系统在不牺牲可靠性的情况下发挥最大效能。
