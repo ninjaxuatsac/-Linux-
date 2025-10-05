@@ -150,7 +150,7 @@ journalctl -u univ-health -b --no-pager
 
 | 路径 | 用途 |
 |------|------|
-| /etc/sysctl极/99-universal-net.conf | 网络缓冲优化参数 |
+| /etc/sysctl/99-universal-net.conf | 网络缓冲优化参数 |
 | /etc/security/limits.d/99-universal.conf | ulimit 配置 |
 | /etc/systemd/system/univ-offload@.service | Offload 自启服务 |
 | /etc/systemd/system/univ-irqpin@.service | IRQ 绑定服务 |
