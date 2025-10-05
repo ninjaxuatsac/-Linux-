@@ -42,11 +42,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/buyi06/-Linux-/main/univ
 
 ---
 
-## 📊 查看状态
+📊 查看状态
 
-```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/buyi06/-Linux-/main/universal_optimize.sh)" status
-```
 
 **输出示例**:
 ```
