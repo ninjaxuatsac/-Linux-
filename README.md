@@ -68,12 +68,10 @@ univ-offload@eth0.service: active
 
 ---
 
-## 🔁 自动修复缺失项
 
-```bash
-bash -c "$(curl -fsSL httpsraw.githubusercontent.com/buyi06/-Linux-/main/universal_optimize.sh)" repair
-```
+🩹 自动修复缺失项
 
+curl -fsSL https://raw.githubusercontent.com/buyi06/-Linux-/main/universal_optimize.sh | bash -s -- repair
 脚本会检测并修复：
 - sysctl 配置文件是否存在
 - offload / irqpin systemd 服务是否丢失
