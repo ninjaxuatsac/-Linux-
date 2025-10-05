@@ -1,293 +1,301 @@
 #!/usr/bin/env bash
 # universal_optimize.sh
-# 通用 Linux 网络/内核安全优化（仅系统层；不改应用/防火墙）
-# 适配：Debian/Ubuntu、RHEL/CentOS/Alma/Rocky、openSUSE、Alpine，以及常见云厂商
-# 设计目标：一次执行 -> 立即生效 + 尽量持久化；出错不终止（降级兜底）
+# 通用安全网络优化（UDP/TCP缓冲、关闭网卡offload、可选IRQ绑定、开机自检）
+# - 幂等可重复执行
+# - 失败默认忽略（不锁机、不卡网）
+# - 不修改应用/防火墙/代理配置
+set -Eeuo pipefail
 
-set -euo pipefail
-umask 022
-
-ACTION="${1:-apply}"     # apply | status | repair
-LOG_PREFIX="[universal-optimize]"
+ACTION="${1:-apply}"
 SYSCTL_FILE="/etc/sysctl.d/99-universal-net.conf"
-UNIT_NAME="univ-offload@.service"
-UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
-HELPER="/usr/local/sbin/univ-disable-offloads"
-DEFAULT_IFACE=""
+LIMITS_FILE="/etc/security/limits.d/99-universal.conf"
+SYSTEMD_LIMITS_DIR="/etc/systemd/system.conf.d"
+SYSTEMD_LIMITS_FILE="${SYSTEMD_LIMITS_DIR}/99-universal-limits.conf"
+OFFLOAD_UNIT="/etc/systemd/system/univ-offload@.service"
+IRQPIN_UNIT="/etc/systemd/system/univ-irqpin@.service"
+HEALTH_UNIT="/etc/systemd/system/univ-health.service"
+ENV_FILE="/etc/default/universal-optimize"
 
-log()   { printf "%s %s\n" "$LOG_PREFIX" "$*"; }
-ok()    { printf "\033[32m%s %s\033[0m\n" "$LOG_PREFIX" "$*"; }
-warn()  { printf "\033[33m%s %s\033[0m\n" "$LOG_PREFIX" "$*"; }
-err()   { printf "\033[31m%s %s\033[0m\n" "$LOG_PREFIX" "$*"; }
-
-is_cmd(){ command -v "$1" >/dev/null 2>&1; }
+#------------- helpers -------------
+ok(){   printf "\033[32m%s\033[0m\n" "$*"; }
+warn(){ printf "\033[33m%s\033[0m\n" "$*"; }
+err(){  printf "\033[31m%s\033[0m\n" "$*"; }
 
 detect_iface() {
-  # 1) 走默认路由网卡
-  if is_cmd ip; then
-    local dev
-    dev="$(ip -o route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
-    if [[ -n "${dev:-}" ]]; then DEFAULT_IFACE="$dev"; return 0; fi
+  # IFACE 可由环境变量覆盖：IFACE=ens3 bash universal_optimize.sh apply
+  if [[ -n "${IFACE:-}" && -e "/sys/class/net/${IFACE}" ]]; then
+    echo "$IFACE"; return
   fi
-  # 2) 退化到第一个非 lo 网卡
-  if is_cmd ip; then
-    local first
-    first="$(ip -o link 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|docker|veth|br-|virbr|tun|tap)' | head -n1 || true)"
-    if [[ -n "${first:-}" ]]; then DEFAULT_IFACE="$first"; return 0; fi
+  # 1) 优先路由探测
+  local dev
+  dev="$(ip -o route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  if [[ -n "$dev" && -e "/sys/class/net/${dev}" ]]; then
+    echo "$dev"; return
   fi
-  # 3) 还不行就尝试常见命名
-  for n in eth0 ens3 enp1s0; do
-    if [[ -e "/sys/class/net/$n" ]]; then DEFAULT_IFACE="$n"; return 0; fi
-  done
-  return 1
+  # 2) 第一个非 lo 的 UP 接口
+  dev="$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}' || true)"
+  if [[ -n "$dev" && -e "/sys/class/net/${dev}" ]]; then
+    echo "$dev"; return
+  fi
+  # 3) 兜底：第一个非 lo 接口
+  dev="$(ip -o link show 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}' || true)"
+  [[ -n "$dev" ]] && echo "$dev"
 }
 
 pkg_install() {
-  # 尽量静默安装依赖：iproute2（通常已自带）、ethtool、grep、awk 等
-  local need=()
-  is_cmd ip       || need+=("iproute2")  # RHEL系叫 iproute
-  is_cmd ethtool  || need+=("ethtool")
-  [[ ${#need[@]} -eq 0 ]] && return 0
-
-  if is_cmd apt-get; then
+  # 仅在缺失时尝试安装 ethtool（静默失败也无所谓）
+  command -v ethtool >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y --no-install-recommends ethtool iproute2 >/dev/null 2>&1 || true
-    return 0
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ethtool >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf -y install ethtool >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum -y install ethtool >/dev/null 2>&1 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install ethtool >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm ethtool >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache ethtool >/dev/null 2>&1 || true
   fi
-  if is_cmd dnf; then
-    dnf install -y ethtool iproute >/dev/null 2>&1 || true
-    return 0
-  fi
-  if is_cmd yum; then
-    yum install -y ethtool iproute >/dev/null 2>&1 || true
-    return 0
-  fi
-  if is_cmd zypper; then
-    zypper -n in ethtool iproute2 >/dev/null 2>&1 || true
-    return 0
-  fi
-  if is_cmd apk; then
-    apk add --no-progress ethtool iproute2 >/dev/null 2>&1 || true
-    return 0
-  fi
-  warn "未找到可用包管理器，跳过自动安装依赖（若缺少 ethtool 将降级处理）"
 }
 
-max_val() {
-  # echo max(a, b)
-  local a="$1" b="$2"
-  if (( a > b )); then echo "$a"; else echo "$b"; fi
+runtime_sysctl_safe() {
+  # 按键值对运行态注入，忽略不存在的键，避免报错
+  local k v
+  while IFS='=' read -r k v; do
+    k="$(echo "$k" | xargs)"; v="$(echo "$v" | xargs)"
+    [[ -z "$k" || "$k" =~ ^# ]] && continue
+    sysctl -w "$k=$v" >/dev/null 2>&1 || true
+  done <<'KV'
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.core.optmem_max=8388608
+net.core.netdev_max_backlog=50000
+net.core.somaxconn=16384
+net.ipv4.ip_local_port_range=10240 65535
+net.ipv4.udp_mem=8192 16384 32768
+net.ipv4.udp_rmem_min=131072
+net.ipv4.udp_wmem_min=131072
+KV
 }
 
-apply_sysctl_safe() {
-  # 只“抬高”默认缓冲/UDP三元组，不降低现有更高值；不触碰 rmem_max/wmem_max/tcp 拥塞算法等
-  local rdef_now wdef_now opt_now u1 u2 u3
-  rdef_now="$(sysctl -n net.core.rmem_default 2>/dev/null || echo 212992)"
-  wdef_now="$(sysctl -n net.core.wmem_default 2>/dev/null || echo 212992)"
-  opt_now="$(sysctl -n net.core.optmem_max   2>/dev/null || echo 10240)"
-  read -r u1 u2 u3 <<<"$(sysctl -n net.ipv4.udp_mem 2>/dev/null || echo '0 0 0')"
-
-  # 目标（以 4K页为例：32/64/128MB）
-  local rdef_t=4194304 wdef_t=4194304 opt_t=8388608
-  local u1_t=8192 u2_t=16384 u3_t=32768
-
-  local rdef_new wdef_new opt_new u1_new u2_new u3_new
-  rdef_new="$(max_val "$rdef_now" "$rdef_t")"
-  wdef_new="$(max_val "$wdef_now" "$wdef_t")"
-  opt_new="$(max_val "$opt_now"  "$opt_t")"
-
-  # 如果当前 udp_mem 未取到，按目标写
-  if [[ -z "${u1:-}" || -z "${u2:-}" || -z "${u3:-}" ]]; then
-    u1_new="$u1_t"; u2_new="$u2_t"; u3_new="$u3_t"
-  else
-    u1_new="$(max_val "$u1" "$u1_t")"
-    u2_new="$(max_val "$u2" "$u2_t")"
-    u3_new="$(max_val "$u3" "$u3_t")"
-  fi
-
-  cat >"$SYSCTL_FILE" <<CONF
-# 由 universal_optimize.sh 生成（安全、保守，不覆盖更高阈值）
-net.core.rmem_default = $rdef_new
-net.core.wmem_default = $wdef_new
-net.core.optmem_max   = $opt_new
-# UDP 阈值（页）：约 32MB/64MB/128MB（假设 4K 页）
-net.ipv4.udp_mem      = $u1_new $u2_new $u3_new
-# 轻量系统项，不影响稳定性
-vm.swappiness = 10
-fs.file-max   = $(max_val "$(sysctl -n fs.file-max 2>/dev/null || echo 100000)" 2097152)
+apply_sysctl() {
+  # 持久化 sysctl（键都很通用，内核缺失也无碍；加载失败不阻塞）
+  cat >"$SYSCTL_FILE" <<'CONF'
+# === universal-optimize: safe network tuning ===
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+net.core.optmem_max   = 8388608
+net.core.netdev_max_backlog = 50000
+net.core.somaxconn = 16384
+net.ipv4.ip_local_port_range = 10240 65535
+# UDP pages triple ≈ 32MB / 64MB / 128MB (4K page)
+net.ipv4.udp_mem      = 8192 16384 32768
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
 CONF
-
+  # 运行态注入（避免因某些键不存在而报错）
+  runtime_sysctl_safe
+  # 持久加载（即使有键不存在也忽略退出码）
   sysctl --system >/dev/null 2>&1 || true
-  ok "sysctl 已应用并持久化：$SYSCTL_FILE"
+  ok "[universal-optimize] sysctl 已应用并持久化：$SYSCTL_FILE"
 }
 
-write_helper_script() {
-  # 运行一次关 offload（忽略失败），并支持 @reboot / udev 调用
-  cat >"$HELPER" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-IFACE="${1:-}"
-[[ -z "$IFACE" ]] && exit 0
-ET="$(command -v ethtool || echo /sbin/ethtool)"
-# 尽可能关闭（不支持/失败都忽略）
-$ET -K "$IFACE" gro off gso off tso off lro off scatter-gather off rx-gro-hw off 2>/dev/null || true
-exit 0
-SH
-  chmod +x "$HELPER"
+apply_limits() {
+  # 提升文件句柄数（对交互用户与大多数服务友好）
+  mkdir -p "$(dirname "$LIMITS_FILE")"
+  cat >"$LIMITS_FILE" <<'LIM'
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc  unlimited
+* hard nproc  unlimited
+LIM
+  mkdir -p "$SYSTEMD_LIMITS_DIR"
+  cat >"$SYSTEMD_LIMITS_FILE" <<'SVC'
+[Manager]
+DefaultLimitNOFILE=1048576
+SVC
+  # 不强制 daemon-reexec，留到下次引导或服务重启生效
+  ok "[universal-optimize] ulimit 默认提升（新会话/服务生效）"
 }
 
-write_systemd_unit() {
-  # oneshot + RemainAfterExit；所有失败都被忽略（前缀 -）
-  cat >"$UNIT_PATH" <<'UNIT'
+apply_offload_unit() {
+  local iface="$1"
+  # systemd 模板单元：绑定网卡设备、等待链路UP、关闭常见 offload
+  cat >"$OFFLOAD_UNIT" <<'UNIT'
 [Unit]
-Description=Disable NIC offloads for %i (universal-safe)
-After=network-online.target
+Description=Universal: disable NIC offloads for %i
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device network-online.target
 Wants=network-online.target
 ConditionPathExists=/sys/class/net/%i
 
 [Service]
 Type=oneshot
-# 等链路 UP 最多 10 秒
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 20); do ip link show %i 2>/dev/null | grep -q "state UP" && exit 0; sleep 0.5; done; exit 0'
-ExecStart=-/usr/local/sbin/univ-disable-offloads %i
+# 等链路UP（最长8秒）
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 16); do ip link show %i 2>/dev/null | grep -q "state UP" && exit 0; sleep 0.5; done; exit 0'
+# 容错：自动寻找 ethtool；不支持的特性忽略
+ExecStart=-/bin/bash -lc '
+  ET=$(command -v ethtool || echo /usr/sbin/ethtool)
+  if ! command -v ethtool >/dev/null 2>&1 && [[ ! -x "$ET" ]]; then
+    echo "[offload] ethtool 不存在，跳过"
+    exit 0
+  fi
+  $ET -K %i gro off gso off tso off lro off scatter-gather off rx-gro-hw off rx-udp-gro-forwarding off 2>/dev/null || true
+'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload || true
+  systemctl daemon-reload
+  systemctl enable "univ-offload@${iface}.service" >/dev/null 2>&1 || true
+  systemctl restart "univ-offload@${iface}.service" >/dev/null 2>&1 || true
+  ok "[universal-optimize] systemd 持久化 offload 关闭：univ-offload@${iface}.service"
+
+  # 立即尝试一次（即便 systemd 未生效也尽量落地）
+  if command -v ethtool >/dev/null 2>&1 || [[ -x /usr/sbin/ethtool ]]; then
+    (ethtool -K "$iface" gro off gso off tso off lro off scatter-gather off rx-gro-hw off rx-udp-gro-forwarding off >/dev/null 2>&1 || true)
+    ok "[universal-optimize] 已对 $iface 进行一次性 offload 关闭尝试"
+  fi
 }
 
-enable_offload_persist() {
+apply_irqpin_unit() {
   local iface="$1"
-  if is_cmd systemctl && systemctl >/dev/null 2>&1; then
-    systemctl enable --now "univ-offload@${iface}.service" >/dev/null 2>&1 || true
-    # 验证执行态（oneshot 执行成功会是 active (exited)）
-    if systemctl is-active "univ-offload@${iface}.service" >/dev/null 2>&1; then
-      ok "systemd 持久化 offload 关闭：univ-offload@${iface}.service"
-      return 0
-    fi
-    warn "systemd 单元未处于 active 状态，但已尝试执行（后备方案将启用）"
-  else
-    warn "未检测到 systemd，启用后备持久化方案"
-  fi
-
-  # 后备1：@reboot 任务（如果有 cron）
-  if is_cmd crontab; then
-    local line="@reboot $HELPER ${iface} >/dev/null 2>&1 || true"
-    (crontab -l 2>/dev/null | grep -v "$HELPER" ; echo "$line") | crontab - || true
-    ok "已写入 root 的 @reboot 任务作为持久化后备"
-    return 0
-  fi
-
-  # 后备2：rc.local（为 systemd 创建 rc-local.service）
-  if [[ ! -f /etc/rc.local ]]; then
-    cat >/etc/rc.local <<'RC'
-#!/bin/sh -e
-exit 0
-RC
-    chmod +x /etc/rc.local
-  fi
-  if ! grep -q "$HELPER" /etc/rc.local; then
-    sed -i "s|^exit 0|$HELPER ${iface} >/dev/null 2>\&1 || true\nexit 0|" /etc/rc.local
-  fi
-  if is_cmd systemctl; then
-    # 有些系统没有默认的 rc-local.service
-    if [[ ! -f /etc/systemd/system/rc-local.service && ! -f /lib/systemd/system/rc-local.service ]]; then
-      cat >/etc/systemd/system/rc-local.service <<'UNIT'
+  # IRQ 绑定（KVM/virtio 多数没有主 IRQ / MSI，这里全程容错）
+  cat >"$IRQPIN_UNIT" <<'UNIT'
 [Unit]
-Description=/etc/rc.local Compatibility
-After=network.target
+Description=Universal: pin NIC IRQs of %i to CPU0 (safe)
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+ConditionPathExists=/sys/class/net/%i
 
 [Service]
-Type=forking
-ExecStart=/etc/rc.local start
-TimeoutSec=0
+Type=oneshot
+ExecStart=-/bin/bash -lc '
+  IF="%i"
+  main_irq=$(cat /sys/class/net/$IF/device/irq 2>/dev/null || true)
+  if [[ -n "$main_irq" && -w /proc/irq/$main_irq/smp_affinity ]]; then
+    echo 1 > /proc/irq/$main_irq/smp_affinity 2>/dev/null && echo "[irq] 主 IRQ $main_irq -> CPU0"
+  else
+    echo "[irq] 未发现主 IRQ（虚拟网卡常见，跳过）"
+  fi
+  for f in /sys/class/net/$IF/device/msi_irqs/*; do
+    [[ -f "$f" ]] || continue
+    irq=$(basename "$f")
+    echo 1 > /proc/irq/$irq/smp_affinity 2>/dev/null && echo "[irq] MSI IRQ $irq -> CPU0"
+  done
+  exit 0
+'
 RemainAfterExit=yes
-GuessMainPID=no
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-      systemctl daemon-reload || true
-    fi
-    systemctl enable --now rc-local.service >/dev/null 2>&1 || true
-  fi
-  ok "rc.local 持久化后备已启用"
+  systemctl daemon-reload
+  systemctl enable "univ-irqpin@${iface}.service" >/dev/null 2>&1 || true
+  systemctl restart "univ-irqpin@${iface}.service" >/dev/null 2>&1 || true
+  ok "[universal-optimize] IRQ 绑定服务已配置（缺 IRQ 时自动跳过）"
 }
 
-apply_now_once() {
-  local iface="$1"
-  if [[ -z "$iface" || ! -e "/sys/class/net/$iface" ]]; then
-    warn "未找到有效网卡，跳过即时 offload 关闭"
-    return 0
+apply_health_unit() {
+  # 持久记录一次自检到日志（不依赖网络，不依赖脚本路径）
+  cat >"$ENV_FILE" <<EOF
+IFACE="${IFACE}"
+SYSCTL_FILE="${SYSCTL_FILE}"
+EOF
+
+  cat >"$HEALTH_UNIT" <<'UNIT'
+[Unit]
+Description=Universal Optimize: boot health report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc '
+  source /etc/default/universal-optimize 2>/dev/null || true
+  IF="${IFACE:-$(ip -o route get 1.1.1.1 2>/dev/null | awk "/dev/ {for(i=1;i<=NF;i++) if(\$i==\"dev\"){print \$(i+1); exit}}")}"
+  ET=$(command -v ethtool || echo /usr/sbin/ethtool)
+  echo "=== 自检报告 ($(date "+%F %T")) ==="
+  systemctl is-active "univ-offload@${IF:-$IF}.service" >/dev/null 2>&1 && echo "offload: active" || echo "offload: inactive"
+  systemctl is-active "univ-irqpin@${IF:-$IF}.service"   >/dev/null 2>&1 && echo "irqpin : active" || echo "irqpin : inactive/ignored"
+  [[ -n "${SYSCTL_FILE:-}" && -f "${SYSCTL_FILE:-}" ]] && echo "sysctl : ${SYSCTL_FILE}" || echo "sysctl : missing"
+  if [[ -x "$ET" && -n "$IF" ]]; then
+    $ET -k "$IF" 2>/dev/null | egrep -i "gro|gso|tso|lro|scatter-gather" | sed -n "1,40p" || true
   fi
-  "$HELPER" "$iface" || true
-  ok "已对 $iface 进行一次性 offload 关闭尝试"
+  sysctl -n net.core.rmem_default net.core.wmem_default net.core.optmem_max \
+             net.core.netdev_max_backlog net.core.somaxconn net.ipv4.udp_mem \
+             net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min 2>/dev/null | nl -ba || true
+'
+UNIT
+  systemctl daemon-reload
+  systemctl enable univ-health.service >/dev/null 2>&1 || true
 }
 
-show_status() {
+status_report() {
   local iface="$1"
   echo "=== 状态报告 ($(date '+%F %T')) ==="
-  echo "- 目标网卡：${iface:-<未检测到>}"
+  echo "- 目标网卡：$iface"
   echo "- sysctl 文件：$SYSCTL_FILE"
-  if [[ -f "$SYSCTL_FILE" ]]; then
-    sysctl -n net.core.rmem_default net.core.wmem_default net.core.optmem_max \
-      net.ipv4.udp_mem net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min 2>/dev/null | nl -ba
+  sysctl -n net.core.rmem_default net.core.wmem_default net.core.optmem_max \
+           net.core.netdev_max_backlog net.core.somaxconn net.ipv4.udp_mem \
+           net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min 2>/dev/null | nl -ba || true
+  echo
+  local ET
+  ET=$(command -v ethtool || echo /usr/sbin/ethtool)
+  if [[ -x "$ET" ]]; then
+    $ET -k "$iface" 2>/dev/null | egrep -i 'gro|gso|tso|lro|scatter-gather' | sed -n '1,60p' || true
   else
-    warn "未找到 $SYSCTL_FILE（可执行 repair）"
+    warn "ethtool 不存在，无法显示 offload 细节"
   fi
   echo
-  if [[ -n "${iface:-}" && -e "/sys/class/net/$iface" ]]; then
-    if is_cmd ethtool; then
-      ethtool -k "$iface" 2>/dev/null | egrep -i 'gro|gso|tso|lro|scatter-gather' | sed -n '1,40p' || true
-    else
-      warn "缺少 ethtool，无法显示 offload 状态"
-    fi
-    echo
-    if is_cmd systemctl; then
-      systemctl is-enabled "univ-offload@${iface}.service" >/dev/null 2>&1 && \
-        echo "univ-offload@${iface}.service: enabled" || echo "univ-offload@${iface}.service: not-enabled"
-      systemctl is-active  "univ-offload@${iface}.service" >/dev/null 2>&1 && \
-        echo "univ-offload@${iface}.service: active"  || echo "univ-offload@${iface}.service: inactive"
-    fi
-  else
-    warn "未检测到有效网卡，无法展示 offload 状态"
-  fi
-}
-
-apply_all() {
-  pkg_install
-  detect_iface || { err "无法探测网卡；请传参：IFACE=xxx bash universal_optimize.sh apply"; exit 0; }
-  local iface="${IFACE:-$DEFAULT_IFACE}"
-
-  apply_sysctl_safe
-  write_helper_script
-  write_systemd_unit
-  enable_offload_persist "$iface"
-  apply_now_once "$iface"
-  show_status "$iface"
+  systemctl is-enabled "univ-offload@${iface}.service" 2>/dev/null || true
+  systemctl is-active  "univ-offload@${iface}.service" 2>/dev/null || true
+  systemctl is-enabled "univ-irqpin@${iface}.service" 2>/dev/null || true
+  systemctl is-active  "univ-irqpin@${iface}.service" 2>/dev/null || true
 }
 
 repair_missing() {
-  pkg_install
-  detect_iface || { warn "无法探测网卡"; }
-  local iface="${IFACE:-$DEFAULT_IFACE}"
-
-  [[ -x "$HELPER" ]]     || write_helper_script
-  [[ -f "$UNIT_PATH" ]]  || write_systemd_unit
-  [[ -f "$SYSCTL_FILE" ]]|| apply_sysctl_safe
-
-  if [[ -n "${iface:-}" ]]; then
-    enable_offload_persist "$iface"
-    apply_now_once "$iface"
-  fi
-  show_status "$iface"
+  # 只补缺，不动已有
+  [[ -f "$SYSCTL_FILE" ]] || apply_sysctl
+  [[ -f "$LIMITS_FILE" ]] || apply_limits
+  [[ -f "$OFFLOAD_UNIT" ]] || apply_offload_unit "$IFACE"
+  [[ -f "$IRQPIN_UNIT"  ]] || apply_irqpin_unit "$IFACE"
+  [[ -f "$HEALTH_UNIT"  ]] || apply_health_unit
+  ok "✅ 缺失项已自动补齐"
 }
 
+#------------- main -------------
+IFACE="$(detect_iface || true)"
+if [[ -z "$IFACE" ]]; then
+  err "[universal-optimize] 无法自动探测网卡，请用 IFACE=xxx 再试"
+  exit 1
+fi
+
 case "$ACTION" in
-  apply)  apply_all ;;
-  repair) repair_missing ;;
-  status) detect_iface || true; show_status "${IFACE:-$DEFAULT_IFACE}" ;;
-  *) echo "用法: bash universal_optimize.sh [apply|status|repair]  (默认 apply)"; exit 0;;
+  apply)
+    pkg_install
+    apply_sysctl
+    apply_limits
+    apply_offload_unit "$IFACE"
+    apply_irqpin_unit "$IFACE"
+    apply_health_unit
+    status_report "$IFACE"
+    ;;
+  status)
+    status_report "$IFACE"
+    ;;
+  repair)
+    pkg_install
+    repair_missing
+    status_report "$IFACE"
+    ;;
+  *)
+    echo "用法：bash $0 [apply|status|repair]"
+    echo "示例：IFACE=ens3 bash $0 apply    # 手动指定网卡"
+    exit 1
+    ;;
 esac
